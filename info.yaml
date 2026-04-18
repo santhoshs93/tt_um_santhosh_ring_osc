@@ -1,0 +1,53 @@
+# Tiny Tapeout project information
+project:
+  title:        "Ring Oscillator with PVT Sensor"
+  author:       "Prof. Santhosh Sivasubramani, IIT Delhi"
+  discord:      ""
+  description:  "3-length selectable ring oscillator with 16-bit frequency counter for process/voltage/temperature characterization"
+  language:     "Verilog"
+  clock_hz:     50000000
+
+  # How many tiles your design occupies? A single tile is about 167x108 uM.
+  tiles: "1x1"
+
+  # Your top module name must start with "tt_um_". Make it unique by including your github username:
+  top_module:  "tt_um_santhosh_ring_osc"
+
+  # List your project's source files here.
+  source_files:
+    - "project.v"
+
+# The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
+pinout:
+  # Inputs
+  ui[0]: "ro_sel[0]"
+  ui[1]: "ro_sel[1]"
+  ui[2]: "cnt_enable"
+  ui[3]: "cnt_clear_latch"
+  ui[4]: "byte_sel"
+  ui[5]: "ro7_dis"
+  ui[6]: "ro11_dis"
+  ui[7]: "ro15_dis"
+
+  # Outputs
+  uo[0]: "freq_count[0]"
+  uo[1]: "freq_count[1]"
+  uo[2]: "freq_count[2]"
+  uo[3]: "freq_count[3]"
+  uo[4]: "freq_count[4]"
+  uo[5]: "freq_count[5]"
+  uo[6]: "freq_count[6]"
+  uo[7]: "freq_count[7]"
+
+  # Bidirectional pins
+  uio[0]: "overflow"
+  uio[1]: "ro_raw_out"
+  uio[2]: "ro_synced"
+  uio[3]: ""
+  uio[4]: ""
+  uio[5]: ""
+  uio[6]: ""
+  uio[7]: ""
+
+# Do not change!
+yaml_version: 6
