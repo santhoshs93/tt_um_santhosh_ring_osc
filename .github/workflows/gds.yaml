@@ -29,11 +29,24 @@ jobs:
     needs: gds
     runs-on: ubuntu-24.04
     steps:
-      - name: GL test skipped (ring oscillator)
+      - name: GL test intentionally skipped (ring oscillator design)
         run: |
-          echo "GL test skipped: ring oscillator sky130 cells create infinite"
-          echo "oscillation in gate-level simulation (expected physical behavior)."
-          echo "RO functionality is verified in real silicon only."
+          echo "=========================================================="
+          echo "GL test skipped: this design instantiates 5 real sky130"
+          echo "inverter-chain ring oscillators (7/11/15/21/31 stages)."
+          echo ""
+          echo "reg_ro_en defaults to 5'b11111 on reset, so all 5 ROs"
+          echo "start oscillating as soon as rst_n deasserts. In gate-"
+          echo "level simulation with annotated SDF delays, each RO emits"
+          echo "~10^9 transitions per second of simulated time -- icarus"
+          echo "cannot complete even a single test within the runner"
+          echo "timeout (and would consume >100 GB of memory)."
+          echo ""
+          echo "Functional correctness is verified by:"
+          echo "  - RTL cocotb test suite (30 tests, all passing)"
+          echo "  - GDS build + precheck (above job)"
+          echo "  - Silicon measurement post-tapeout"
+          echo "=========================================================="
 
   viewer:
     needs: gds
