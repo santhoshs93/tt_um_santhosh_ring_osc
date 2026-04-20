@@ -2,12 +2,15 @@
  * Copyright (c) 2026 Prof. Santhosh Sivasubramani, IIT Delhi
  * SPDX-License-Identifier: Apache-2.0
  *
- * Ring Oscillator with PVT Sensor
+ * Ring Oscillator with PVT Sensor & TRNG
  * - 5 individually-gatable RO lengths: 7, 11, 15, 21, 31 stages
  * - 16-bit frequency counter with configurable gate time
  * - SPI-configurable: RO select, per-RO enable, auto gate timer, prescaler
  * - Parallel control mode for basic operation without SPI
  * - Configurable prescaler (÷8/÷16/÷32/÷64) for optimal synchronization
+ * - XOR jitter TRNG: extracts random bits from RO pair phase jitter
+ * - Health monitor: frequency bounds checking with alert flags
+ * - Differential RO mode: measures beat-frequency of two selected ROs
  * - Process/voltage/temperature characterization baseline
  * - Uses sky130 standard cells for synthesizable ring oscillators
  */
@@ -68,6 +71,10 @@ module tt_um_santhosh_ring_osc (
     reg [7:0] reg_gate_l;      // 0x03: auto gate time [7:0]
     reg [7:0] reg_gate_h;      // 0x04: auto gate time [15:8]
     reg [7:0] reg_prescale;    // 0x05: [1:0]=prescaler (0=÷8, 1=÷16, 2=÷32, 3=÷64)
+    reg [7:0] reg_trng_ctrl;   // 0x09: [0]=trng_en, [1]=health_en, [2]=diff_mode
+    reg [7:0] reg_diff_sel;    // 0x0A: [2:0]=RO_B select for XOR/diff
+    reg [7:0] reg_health_lo;   // 0x0B: health freq lower bound
+    reg [7:0] reg_health_hi;   // 0x0C: health freq upper bound
 
     // Edge detect for auto gate start
     reg gate_start_prev;
@@ -86,6 +93,10 @@ module tt_um_santhosh_ring_osc (
             reg_gate_l   <= 8'h00;
             reg_gate_h   <= 8'h00;
             reg_prescale <= 8'h01;   // Default ÷16
+            reg_trng_ctrl  <= 8'h00;
+            reg_diff_sel   <= 8'h01; // Default RO_B = 11-stage
+            reg_health_lo  <= 8'h00;
+            reg_health_hi  <= 8'hFF;
         end else begin
             // Auto-clear start bit after edge detected
             if (gate_start_edge)
@@ -102,6 +113,10 @@ module tt_um_santhosh_ring_osc (
                     8'h03: reg_gate_l   <= wr_data;
                     8'h04: reg_gate_h   <= wr_data;
                     8'h05: reg_prescale <= wr_data;
+                    8'h09: reg_trng_ctrl  <= wr_data;
+                    8'h0A: reg_diff_sel   <= wr_data;
+                    8'h0B: reg_health_lo  <= wr_data;
+                    8'h0C: reg_health_hi  <= wr_data;
                     default: ;
                 endcase
             end
@@ -111,6 +126,8 @@ module tt_um_santhosh_ring_osc (
     // Forward declarations for read mux
     wire [7:0] reg_status;
     reg [15:0] freq_latch;
+    wire [7:0] reg_trng_data;
+    wire [7:0] reg_health_status;
 
     // Register read mux
     always @(*) begin
@@ -124,6 +141,12 @@ module tt_um_santhosh_ring_osc (
             8'h06: rd_data = reg_status;
             8'h07: rd_data = freq_latch[7:0];
             8'h08: rd_data = freq_latch[15:8];
+            8'h09: rd_data = reg_trng_ctrl;
+            8'h0A: rd_data = reg_diff_sel;
+            8'h0B: rd_data = reg_health_lo;
+            8'h0C: rd_data = reg_health_hi;
+            8'h0D: rd_data = reg_trng_data;
+            8'h0E: rd_data = reg_health_status;
             default: rd_data = 8'h00;
         endcase
     end
@@ -283,6 +306,25 @@ module tt_um_santhosh_ring_osc (
         endcase
     end
 
+    // Second RO output for TRNG XOR pair and differential mode
+    reg ro_out_b;
+    always @(*) begin
+        case (reg_diff_sel[2:0])
+            3'd0:    ro_out_b = ro7_out;
+            3'd1:    ro_out_b = ro11_out;
+            3'd2:    ro_out_b = ro15_out;
+            3'd3:    ro_out_b = ro21_out;
+            3'd4:    ro_out_b = ro31_out;
+            default: ro_out_b = ro11_out;
+        endcase
+    end
+
+    // TRNG: XOR jitter extraction from two ROs
+    wire trng_raw = ro_out ^ ro_out_b;
+
+    // Differential mode: feed XOR beat-frequency to counter
+    wire ro_for_counter = reg_trng_ctrl[2] ? trng_raw : ro_out;
+
     // ============================================================
     // Configurable Prescaler
     // Divides RO frequency for reliable synchronization to 50 MHz clk.
@@ -290,10 +332,10 @@ module tt_um_santhosh_ring_osc (
     // In simulation, ROs are already slow clock dividers — skip prescaler.
     // ============================================================
 `ifdef SIM
-    wire ro_divided = ro_out;  // No prescaler needed in sim
+    wire ro_divided = ro_for_counter;  // No prescaler needed in sim
 `else
     reg [5:0] ro_prescaler;
-    always @(posedge ro_out or negedge rst_n) begin
+    always @(posedge ro_for_counter or negedge rst_n) begin
         if (!rst_n)
             ro_prescaler <= 6'd0;
         else
@@ -322,6 +364,41 @@ module tt_um_santhosh_ring_osc (
             ro_sync <= {ro_sync[1:0], ro_divided};
     end
     wire ro_rising = (ro_sync[2:1] == 2'b01);
+
+    // ============================================================
+    // TRNG: XOR jitter bit collector
+    // ============================================================
+    reg [1:0] trng_sync;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) trng_sync <= 2'b0;
+        else        trng_sync <= {trng_sync[0], trng_raw};
+    end
+
+    reg [7:0] trng_shift;
+    reg [2:0] trng_bit_cnt;
+    reg       trng_valid;
+    reg [7:0] trng_data_reg;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            trng_shift    <= 8'd0;
+            trng_bit_cnt  <= 3'd0;
+            trng_valid    <= 1'b0;
+            trng_data_reg <= 8'd0;
+        end else if (reg_trng_ctrl[0]) begin
+            trng_shift   <= {trng_shift[6:0], trng_sync[1]};
+            trng_bit_cnt <= trng_bit_cnt + 3'd1;
+            if (trng_bit_cnt == 3'd7) begin
+                trng_data_reg <= {trng_shift[6:0], trng_sync[1]};
+                trng_valid    <= 1'b1;
+            end
+        end else begin
+            trng_bit_cnt <= 3'd0;
+            trng_valid   <= 1'b0;
+        end
+    end
+
+    assign reg_trng_data = trng_data_reg;
 
     // ============================================================
     // Edge detectors
@@ -412,6 +489,35 @@ module tt_um_santhosh_ring_osc (
     // Status register (read-only at 0x06)
     // ============================================================
     assign reg_status = {5'b0, meas_done, overflow, gate_active};
+
+    // ============================================================
+    // Health Monitor: frequency bounds check after measurement
+    // ============================================================
+    reg meas_done_prev;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) meas_done_prev <= 1'b0;
+        else        meas_done_prev <= meas_done;
+    end
+    wire meas_done_edge = meas_done & ~meas_done_prev;
+
+    reg health_below, health_above, health_stuck, health_ok;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            health_below <= 1'b0;
+            health_above <= 1'b0;
+            health_stuck <= 1'b0;
+            health_ok    <= 1'b0;
+        end else if (meas_done_edge && reg_trng_ctrl[1]) begin
+            health_stuck <= (freq_latch == 16'd0);
+            health_below <= (freq_latch[7:0] < reg_health_lo);
+            health_above <= (freq_latch[7:0] > reg_health_hi);
+            health_ok    <= (freq_latch[7:0] >= reg_health_lo) &&
+                            (freq_latch[7:0] <= reg_health_hi) &&
+                            (freq_latch != 16'd0);
+        end
+    end
+
+    assign reg_health_status = {3'b0, trng_valid, health_ok, health_stuck, health_above, health_below};
 
     // ============================================================
     // Output assignments

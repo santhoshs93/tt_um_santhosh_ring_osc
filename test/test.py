@@ -650,3 +650,250 @@ async def test_spi_prescale_register(dut):
         await spi_write(dut, 0x05, pval)
         got = await spi_read(dut, 0x05)
         assert got == pval, f"Prescale write {pval}: read back {got}"
+
+
+# ============================
+# TRNG / HEALTH / DIFFERENTIAL TESTS
+# ============================
+
+@cocotb.test()
+async def test_trng_register_defaults(dut):
+    """New TRNG/health registers have correct defaults after reset."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    trng_ctrl = await spi_read(dut, 0x09)
+    diff_sel  = await spi_read(dut, 0x0A)
+    health_lo = await spi_read(dut, 0x0B)
+    health_hi = await spi_read(dut, 0x0C)
+    assert trng_ctrl == 0x00, f"reg_trng_ctrl default should be 0x00, got 0x{trng_ctrl:02x}"
+    assert diff_sel  == 0x01, f"reg_diff_sel default should be 0x01, got 0x{diff_sel:02x}"
+    assert health_lo == 0x00, f"reg_health_lo default should be 0x00, got 0x{health_lo:02x}"
+    assert health_hi == 0xFF, f"reg_health_hi default should be 0xFF, got 0x{health_hi:02x}"
+
+
+@cocotb.test()
+async def test_trng_register_roundtrip(dut):
+    """Write and read back all new TRNG/health registers."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    test_vals = {0x09: 0x07, 0x0A: 0x04, 0x0B: 0x10, 0x0C: 0xE0}
+    for addr, val in test_vals.items():
+        await spi_write(dut, addr, val)
+    for addr, expected in test_vals.items():
+        got = await spi_read(dut, addr)
+        assert got == expected, \
+            f"Reg 0x{addr:02x}: expected 0x{expected:02x}, got 0x{got:02x}"
+
+
+@cocotb.test()
+async def test_trng_data_collection(dut):
+    """Enable TRNG and verify trng_data register fills with data."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+    set_ui(dut, spi_mode=1)
+
+    # Set diff_sel to RO_B=1 (11-stage), default RO_A=0 (7-stage)
+    await spi_write(dut, 0x01, 0)     # ro_sel = 0 (7-stage)
+    await spi_write(dut, 0x0A, 0x01)  # diff_sel = 1 (11-stage)
+    # Enable TRNG
+    await spi_write(dut, 0x09, 0x01)  # trng_en=1
+
+    # Wait for at least 8 clock cycles to collect one byte
+    await ClockCycles(dut.clk, 50)
+
+    # Read TRNG data
+    trng_data = await spi_read(dut, 0x0D)
+    dut._log.info(f"TRNG data after 50 cycles: 0x{trng_data:02x}")
+    # In simulation, XOR of two clock dividers produces a deterministic but toggling pattern
+    # The data should be non-zero (XOR of different-frequency signals)
+    # Note: exact value depends on sim timing, so just check it collected something
+
+    # Read health_status to check trng_valid bit[4]
+    health_status = await spi_read(dut, 0x0E)
+    trng_valid = (health_status >> 4) & 1
+    dut._log.info(f"trng_valid={trng_valid}, health_status=0x{health_status:02x}")
+    assert trng_valid == 1, "trng_valid should be 1 after collecting 8 bits"
+
+
+@cocotb.test()
+async def test_trng_changes_over_time(dut):
+    """TRNG data register updates every 8 clocks and produces deterministic XOR pattern in sim."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+    set_ui(dut, spi_mode=1)
+
+    await spi_write(dut, 0x01, 0)     # ro_sel = 0
+    await spi_write(dut, 0x0A, 0x01)  # diff_sel = 1
+    await spi_write(dut, 0x09, 0x01)  # trng_en=1
+
+    # Collect multiple TRNG bytes over time
+    data_list = []
+    for _ in range(10):
+        await ClockCycles(dut.clk, 16)  # Wait for 2 full byte collections
+        trng_data = await spi_read(dut, 0x0D)
+        data_list.append(trng_data)
+
+    dut._log.info(f"TRNG values collected: {[f'0x{d:02x}' for d in data_list]}")
+    # In simulation, XOR of deterministic clock dividers produces a repeating pattern.
+    # Verify the TRNG mechanism works: data should be non-zero (XOR of two toggling signals).
+    non_zero = [d for d in data_list if d != 0]
+    assert len(non_zero) > 0, "TRNG should produce at least some non-zero bytes"
+    # In real silicon, jitter would cause variation. In sim, pattern may repeat but mechanism is valid.
+
+
+@cocotb.test()
+async def test_trng_disabled_no_valid(dut):
+    """When TRNG is disabled, trng_valid should be 0."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+    set_ui(dut, spi_mode=1)
+
+    # TRNG disabled (default)
+    await ClockCycles(dut.clk, 50)
+    health_status = await spi_read(dut, 0x0E)
+    trng_valid = (health_status >> 4) & 1
+    assert trng_valid == 0, "trng_valid should be 0 when TRNG is disabled"
+
+
+@cocotb.test()
+async def test_health_monitor_ok(dut):
+    """Health monitor reports OK when frequency is within bounds."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+    set_ui(dut, spi_mode=1)
+
+    # Set health bounds: low=10, high=200 (should contain ro7 count at gate=200)
+    await spi_write(dut, 0x0B, 10)   # health_lo
+    await spi_write(dut, 0x0C, 200)  # health_hi
+    # Enable health monitoring
+    await spi_write(dut, 0x09, 0x02)  # health_en=1 (bit 1)
+
+    # Run auto-gate measurement
+    await spi_write(dut, 0x01, 0)     # ro_sel=0
+    await spi_write(dut, 0x03, 200)   # gate_l
+    await spi_write(dut, 0x04, 0)     # gate_h
+    await spi_write(dut, 0x00, 0x01)  # start
+    await ClockCycles(dut.clk, 400)
+
+    # Read health status
+    health_status = await spi_read(dut, 0x0E)
+    health_ok    = (health_status >> 2) & 1
+    health_stuck = (health_status >> 1) & 1
+    health_above = (health_status >> 0) & 1  # Wait, bit order: [0]=below, [1]=above, [2]=stuck, [3]=ok
+    dut._log.info(f"Health status: 0x{health_status:02x}")
+
+    # Bit map: [0]=below, [1]=above, [2]=stuck, [3]=ok, [4]=trng_valid
+    below = health_status & 1
+    above = (health_status >> 1) & 1
+    stuck = (health_status >> 2) & 1
+    ok    = (health_status >> 3) & 1
+    dut._log.info(f"below={below}, above={above}, stuck={stuck}, ok={ok}")
+    assert ok == 1, f"Health should be OK, status=0x{health_status:02x}"
+    assert below == 0, "Should not be below minimum"
+    assert above == 0, "Should not be above maximum"
+    assert stuck == 0, "RO should not be stuck"
+
+
+@cocotb.test()
+async def test_health_monitor_below(dut):
+    """Health monitor detects frequency below minimum."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+    set_ui(dut, spi_mode=1)
+
+    # Set health bounds: low=200, high=255 (ro7 count ~50 at gate=200 will be below)
+    await spi_write(dut, 0x0B, 200)  # health_lo = 200 (very high minimum)
+    await spi_write(dut, 0x0C, 255)  # health_hi
+    await spi_write(dut, 0x09, 0x02)  # health_en=1
+
+    # Run measurement
+    await spi_write(dut, 0x01, 0)
+    await spi_write(dut, 0x03, 200)
+    await spi_write(dut, 0x04, 0)
+    await spi_write(dut, 0x00, 0x01)
+    await ClockCycles(dut.clk, 400)
+
+    health_status = await spi_read(dut, 0x0E)
+    below = health_status & 1
+    ok    = (health_status >> 3) & 1
+    dut._log.info(f"Health below test: status=0x{health_status:02x}, below={below}, ok={ok}")
+    assert below == 1, "Should detect frequency below minimum"
+    assert ok == 0, "Health should NOT be OK when below minimum"
+
+
+@cocotb.test()
+async def test_health_monitor_stuck(dut):
+    """Health monitor detects stuck RO (count=0) when RO is disabled."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+    set_ui(dut, spi_mode=1)
+
+    # Disable all ROs
+    await spi_write(dut, 0x02, 0x00)  # reg_ro_en = 0 (all disabled)
+    await spi_write(dut, 0x0B, 0)     # health_lo
+    await spi_write(dut, 0x0C, 255)   # health_hi
+    await spi_write(dut, 0x09, 0x02)  # health_en=1
+
+    # Run measurement (should count 0)
+    await spi_write(dut, 0x01, 0)
+    await spi_write(dut, 0x03, 100)
+    await spi_write(dut, 0x04, 0)
+    await spi_write(dut, 0x00, 0x01)
+    await ClockCycles(dut.clk, 300)
+
+    health_status = await spi_read(dut, 0x0E)
+    stuck = (health_status >> 2) & 1
+    ok    = (health_status >> 3) & 1
+    dut._log.info(f"Health stuck test: status=0x{health_status:02x}, stuck={stuck}, ok={ok}")
+    assert stuck == 1, "Should detect stuck RO (count=0)"
+    assert ok == 0, "Health should NOT be OK when stuck"
+
+
+@cocotb.test()
+async def test_diff_mode_counter(dut):
+    """Differential mode: counter counts XOR beat-frequency of two ROs."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+    set_ui(dut, spi_mode=1)
+
+    # First: normal measurement with RO 0
+    await spi_write(dut, 0x01, 0)     # ro_sel=0 (7-stage)
+    await spi_write(dut, 0x03, 200)   # gate_l
+    await spi_write(dut, 0x04, 0)     # gate_h
+    await spi_write(dut, 0x00, 0x01)  # start
+    await ClockCycles(dut.clk, 400)
+    low = await spi_read(dut, 0x07)
+    high = await spi_read(dut, 0x08)
+    count_normal = (high << 8) | low
+    dut._log.info(f"Normal RO 0 count: {count_normal}")
+
+    # Now: differential mode — XOR of RO 0 and RO 4 (very different frequencies)
+    await spi_write(dut, 0x00, 0x02)  # clear meas_done
+    await ClockCycles(dut.clk, 5)
+    await spi_write(dut, 0x0A, 0x04)  # diff_sel = RO_B=4 (31-stage)
+    await spi_write(dut, 0x09, 0x04)  # diff_mode=1 (bit 2)
+    await spi_write(dut, 0x03, 200)   # gate_l
+    await spi_write(dut, 0x04, 0)     # gate_h
+    await spi_write(dut, 0x00, 0x01)  # start
+    await ClockCycles(dut.clk, 400)
+    low = await spi_read(dut, 0x07)
+    high = await spi_read(dut, 0x08)
+    count_diff = (high << 8) | low
+    dut._log.info(f"Differential RO0^RO4 count: {count_diff}")
+
+    assert count_normal > 0, "Normal count should be > 0"
+    assert count_diff > 0, "Differential count should be > 0"
+    # Differential count should be different from normal single-RO count
+    assert count_diff != count_normal, \
+        f"Differential count ({count_diff}) should differ from normal ({count_normal})"

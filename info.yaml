@@ -1,9 +1,9 @@
 # Tiny Tapeout project information
 project:
-  title:        "Ring Oscillator with PVT Sensor"
+  title:        "Ring Oscillator PVT Sensor & TRNG"
   author:       "Prof. Santhosh Sivasubramani, IIT Delhi"
   discord:      ""
-  description:  "5-length SPI-configurable ring oscillator (7/11/15/21/31 stages) with 16-bit frequency counter, auto gate timer, and configurable prescaler for process/voltage/temperature characterization"
+  description:  "5 SPI-configurable ring oscillators (7/11/15/21/31 sky130 stages) with 16-bit frequency counter, auto gate timer, configurable prescaler, XOR jitter TRNG, health monitor with frequency bounds checking, and differential RO beat-frequency mode for PVT characterization"
   language:     "Verilog"
   clock_hz:     50000000
 
